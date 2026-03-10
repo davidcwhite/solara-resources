@@ -1,4 +1,4 @@
-# PRD 06: Interactive Charts -- Replacing Matplotlib with Plotly in PandasAI
+# PRD 06: Interactive Charts -- Replacing Matplotlib in PandasAI
 
 ## Problem Statement
 
@@ -16,25 +16,89 @@ We need interactive charts that users can explore -- zoom, pan, hover, select --
 
 ## Goal
 
-Replace PandasAI's matplotlib chart output with **Plotly** figures that render interactively via Solara's `FigurePlotly` component, while keeping PandasAI's natural language query interface intact.
+Replace PandasAI's matplotlib chart output with interactive charts rendered via Solara's native visualization components, while keeping PandasAI's natural language query interface intact.
 
-## Technology Decision: Why Plotly Over ECharts
+## Technology Evaluation: Plotly vs ECharts
+
+Solara has **first-class native components for both** Plotly and ECharts. Both are fully supported, interactive, and production-ready in Solara.
+
+### solara.FigurePlotly
+
+```python
+solara.FigurePlotly(figure)  # accepts plotly.graph_objects.Figure
+```
+
+- Wraps Plotly's `FigureWidget` for reactive rendering
+- Requires `plotly` package as a dependency
+- Full Python API via `plotly.express` and `plotly.graph_objects`
+
+### solara.FigureEcharts
+
+```python
+solara.FigureEcharts(
+    option=dict,           # Standard ECharts option configuration
+    on_click=callback,     # Click event handler
+    on_mouseover=callback, # Hover event handler
+    on_mouseout=callback,  # Mouse-out event handler
+    maps=dict,             # Geographic map data
+    responsive=True,       # Auto-resize with container
+    attributes={"style": "height: 400px;"},
+)
+```
+
+- Built into Solara core -- no extra dependency required
+- Takes a standard ECharts option dict (same format as the ECharts JS docs)
+- Built-in click/hover/mouseout event callbacks
+- Responsive resizing support
+- Supports geographic maps via `maps` parameter
+- Solara docs note: "we do not support a Python API to create the figure data" -- use pyecharts or construct dicts directly
+
+### Comparison
 
 | Criteria | Plotly | ECharts |
 |----------|--------|---------|
-| Solara component | `solara.FigurePlotly` (first-class) | `solara.FigureEcharts` (dict-based, no Python API) |
-| PandasAI support | Listed as optional dependency (`pandasai[plotly]`) | Not supported |
-| Python API | Full Python API (`plotly.express`, `plotly.graph_objects`) | No Python API -- requires raw JS option dicts or pyecharts |
-| LLM code generation | LLM can generate `plotly.express` code directly | LLM would need to generate ECharts JSON -- less natural |
-| pandas integration | `pd.options.plotting.backend = "plotly"` | No pandas backend |
-| Interactive features | Zoom, pan, hover, lasso select, export | Zoom, hover, click events |
-| Static export (for PPTX) | `fig.to_image()` via Kaleido | Requires separate rendering |
+| **Solara component** | `solara.FigurePlotly` (first-class) | `solara.FigureEcharts` (first-class, built-in) |
+| **Extra dependency** | Requires `plotly` package | None -- included with Solara |
+| **Python API** | Full Python API (`plotly.express`, `plotly.graph_objects`) | No Python API in Solara; option dicts or pyecharts |
+| **PandasAI support** | Listed as optional dependency (`pandasai[plotly]`) | Not in PandasAI's dependency list |
+| **LLM code generation** | LLM generates `plotly.express` Python code | LLM generates ECharts JSON option dict or pyecharts code |
+| **Performance** | Good; can lag with very large datasets | Superior; optimized for large datasets and real-time updates |
+| **Interactive features** | Zoom, pan, hover, lasso select, export toolbar | Zoom, hover, click events, data zoom, brush, tooltip |
+| **Event callbacks** | Via FigureWidget trace events | Native `on_click`, `on_mouseover`, `on_mouseout` in Solara |
+| **Static image export** | `fig.to_image()` via Kaleido (simple, one-line) | Requires headless browser (pyppeteer/selenium) -- complex |
+| **Chart types** | Extensive: statistical, scientific, financial, 3D, maps | Extensive: statistical, geographic, 3D, gauge, treemap, sankey |
+| **Theming** | Templates: `plotly_dark`, `plotly_white`, etc. | Rich built-in themes; custom themes via option dict |
+| **pandas integration** | `pd.options.plotting.backend = "plotly"` | No pandas backend |
+| **Geographic/maps** | Mapbox integration | Built-in map support via `maps` parameter |
 
-**Decision**: Use **Plotly** because:
-1. PandasAI already supports it as an optional dependency
-2. The LLM can generate `plotly.express` code naturally (it's a Python library)
-3. Solara has a first-class `FigurePlotly` component
-4. Plotly figures can be exported to static images for PowerPoint (see PRD 07)
+### Recommendation: Plotly for PandasAI-Generated Charts
+
+**For PandasAI integration specifically**, Plotly is the better choice for these reasons:
+
+1. **PandasAI code execution pipeline**: PandasAI generates and executes Python code. The LLM naturally generates `import plotly.express as px; fig = px.bar(df, x="col", y="val")` -- this is idiomatic Python that PandasAI can execute and return as a `go.Figure` object. For ECharts, the LLM would need to generate a Python dict matching the ECharts JSON schema, which is less natural in a Python code generation context.
+
+2. **PandasAI already supports Plotly**: It's a listed optional dependency (`pip install pandasai[plotly]`). ECharts/pyecharts would need to be added via `custom_whitelisted_dependencies` and is untested with PandasAI's sandbox.
+
+3. **Static export for PowerPoint (PRD 07)**: Plotly's `fig.to_image()` via Kaleido is a one-line call returning PNG bytes. ECharts static export requires a headless browser (pyppeteer, selenium, or phantomjs), adding significant deployment complexity.
+
+4. **Object-based response**: PandasAI's `ResponseParser` can intercept a `go.Figure` Python object directly. An ECharts option dict would need to be returned as a raw Python dict and type-checked differently.
+
+**However, ECharts is the better choice for manually-built dashboard charts** (PRD 02) where we control the data pipeline directly, because:
+- No extra dependency (built into Solara)
+- Better performance with large datasets
+- Native click/hover event callbacks in the Solara API
+- Rich built-in chart types for dashboards (gauges, treemaps, sankey diagrams)
+
+### Dual-Library Strategy
+
+Use **both** libraries, each where it fits best:
+
+| Context | Library | Reason |
+|---------|---------|--------|
+| PandasAI chat-generated charts | Plotly | Natural fit for LLM code generation pipeline |
+| Dashboard page (static charts) | ECharts | Built-in, performant, rich event callbacks |
+| Report page charts | Either | Plotly if re-using PandasAI output; ECharts if building custom |
+| PowerPoint export | Plotly | Simple `to_image()` via Kaleido |
 
 ## User Stories
 
@@ -306,6 +370,85 @@ User Query ("Plot revenue by region")
 └──────────────────────────────────┘
 ```
 
+## FR-08: ECharts for Dashboard Charts
+
+For the dashboard page (PRD 02), use `solara.FigureEcharts` for manually-built charts where we control the data pipeline.
+
+```python
+import solara
+
+@solara.component
+def RevenueBarChart(categories: list, values: list):
+    dark = solara.lab.use_dark_effective()
+    
+    option = {
+        "backgroundColor": "transparent",
+        "tooltip": {"trigger": "axis"},
+        "xAxis": {
+            "type": "category",
+            "data": categories,
+            "axisLabel": {"color": "#aaa" if dark else "#333"},
+        },
+        "yAxis": {
+            "type": "value",
+            "axisLabel": {"color": "#aaa" if dark else "#333"},
+        },
+        "series": [{
+            "type": "bar",
+            "data": values,
+            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
+        }],
+    }
+    
+    def on_bar_click(data):
+        # data contains: name, value, dataIndex, seriesName, etc.
+        print(f"Clicked: {data['name']} = {data['value']}")
+    
+    solara.FigureEcharts(option=option, on_click=on_bar_click, responsive=True)
+
+@solara.component
+def TrendLineChart(dates: list, series_data: dict):
+    option = {
+        "tooltip": {"trigger": "axis"},
+        "legend": {"data": list(series_data.keys())},
+        "xAxis": {"type": "category", "data": dates},
+        "yAxis": {"type": "value"},
+        "dataZoom": [{"type": "slider", "start": 0, "end": 100}],
+        "series": [
+            {"name": name, "type": "line", "data": values, "smooth": True}
+            for name, values in series_data.items()
+        ],
+    }
+    solara.FigureEcharts(option=option, responsive=True)
+
+@solara.component
+def DistributionPieChart(data: list):
+    """data: list of {"name": str, "value": number}"""
+    option = {
+        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+        "series": [{
+            "type": "pie",
+            "radius": ["40%", "70%"],  # Donut chart
+            "data": data,
+            "emphasis": {
+                "itemStyle": {
+                    "shadowBlur": 10,
+                    "shadowOffsetX": 0,
+                    "shadowColor": "rgba(0, 0, 0, 0.5)",
+                }
+            },
+        }],
+    }
+    solara.FigureEcharts(option=option, responsive=True)
+```
+
+**ECharts advantages for dashboard use**:
+- No extra dependency -- part of Solara core
+- Built-in `dataZoom` for time series exploration
+- Click events via `on_click` for drill-down navigation
+- Better rendering performance with large datasets
+- Rich chart types: gauge, treemap, sankey, heatmap, radar
+
 ## Dependencies
 
 ```toml
@@ -315,26 +458,34 @@ dependencies = [
     "pandasai[plotly]>=2.3,<3.0",
     "plotly>=5.18",
     "kaleido>=1.0",          # For static export (PRD 07)
+    # ECharts: no extra dependency needed (built into Solara)
 ]
 ```
 
 ## Implementation Plan
 
-### Phase 1: Core Integration
+### Phase 1: PandasAI Plotly Integration (Chat/Explorer)
 1. Install `pandasai[plotly]` and add `plotly` to whitelisted dependencies
 2. Create `SolaraResponseParser` in `services/response_parser.py`
 3. Update `AIService` to use the custom parser and Plotly prompt instructions
 4. Update `ChatMessageContent` to render `go.Figure` via `FigurePlotly`
 
-### Phase 2: Polish
-5. Add theme-aware styling (`ThemedChart` component)
-6. Add matplotlib fallback handling
-7. Tune the LLM prompt for consistent Plotly output across chart types
-8. Add chart toolbar customization (hide/show Plotly modebar buttons)
+### Phase 2: Dashboard ECharts Components
+5. Create reusable ECharts chart components in `components/charts.py` (bar, line, pie, etc.)
+6. Wire dashboard charts to filtered reactive data
+7. Implement click event handlers for drill-down interactions
+8. Add ECharts `dataZoom` for time-series charts
 
-### Phase 3: Dashboard Integration
-9. Store generated Plotly figures in reactive state for reuse on dashboard
-10. Allow pinning a chat-generated chart to the dashboard page
+### Phase 3: Polish
+9. Add theme-aware styling for both Plotly (`ThemedChart`) and ECharts (dark option dicts)
+10. Add matplotlib fallback handling in ResponseParser
+11. Tune the LLM prompt for consistent Plotly output across chart types
+12. Add chart toolbar customization (hide/show Plotly modebar buttons)
+
+### Phase 4: Integration
+13. Store generated Plotly figures in reactive state for reuse on dashboard
+14. Allow pinning a chat-generated chart to the dashboard page
+15. Ensure consistent visual style between ECharts dashboard charts and Plotly chat charts
 
 ## Risks and Mitigations
 
@@ -342,14 +493,18 @@ dependencies = [
 |------|--------|------------|
 | LLM generates matplotlib despite prompt instructions | Static image fallback | Robust fallback in ResponseParser; iterate on prompt wording |
 | Plotly figure serialization across WebSocket | Chart doesn't render | `FigurePlotly` handles serialization natively via FigureWidget |
-| Large datasets make Plotly charts slow | Poor UX | Sample/aggregate data before charting; PandasAI typically does this |
+| Large datasets make Plotly charts slow | Poor UX | Sample/aggregate data before charting; PandasAI typically does this; use ECharts for known-large datasets on dashboard |
 | PandasAI sandbox blocks Plotly imports | Code execution fails | `custom_whitelisted_dependencies: ["plotly"]` resolves this |
+| Visual inconsistency between Plotly and ECharts | Confusing UX | Align color palettes and dark/light theming across both libraries |
+| ECharts static export needed for PPTX | Complex deployment | For dashboard PPTX export, convert ECharts data to Plotly figures for `to_image()`; or use pyppeteer as fallback |
 
 ## Acceptance Criteria
 
-1. Natural language chart requests produce interactive Plotly charts (zoom, pan, hover)
+1. Natural language chart requests via PandasAI produce interactive Plotly charts (zoom, pan, hover)
 2. Charts render inline in the Solara chat interface via `FigurePlotly`
-3. Charts respect the app's dark/light theme
-4. If the LLM falls back to matplotlib, a static image is displayed (not a crash)
-5. No matplotlib `plt.show()` pop-ups occur during chart generation
-6. Chart generation latency is comparable to the existing matplotlib pipeline
+3. Dashboard charts render via `FigureEcharts` with click event handling and data zoom
+4. Both chart types respect the app's dark/light theme
+5. If the LLM falls back to matplotlib, a static image is displayed (not a crash)
+6. No matplotlib `plt.show()` pop-ups occur during chart generation
+7. Chart generation latency is comparable to the existing matplotlib pipeline
+8. ECharts dashboard charts resize responsively on window changes
