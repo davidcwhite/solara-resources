@@ -1,73 +1,50 @@
 # PRD 08: Interactive ECharts in Solara Chat via PandasAI
 
-## Problem Statement
+## Core Concept
 
-PandasAI 2.3's code generation pipeline generates matplotlib code by default. When a user asks "Plot revenue by region," the LLM produces Python code that calls `matplotlib.pyplot`, saves a static PNG to disk, and returns the file path. The Solara chat interface then renders this PNG as a flat image -- no zoom, no hover, no interactivity.
+PandasAI's code generation pipeline currently produces matplotlib code that saves static PNGs. We redirect it to produce **ECharts option dicts** -- plain Python dictionaries -- which Solara's built-in `FigureEcharts` component renders as interactive charts directly inside chat message bubbles.
 
-We want the chat to render **interactive ECharts charts** directly inside chat messages, using Solara's built-in `FigureEcharts` component. This means PandasAI's code generation pipeline must produce ECharts option dicts instead of matplotlib code, and the Solara chat must render those dicts as live, interactive charts.
+The key insight: **the dynamic part is the data, not the component.** You don't need to dynamically generate Solara components. `FigureEcharts` is already the right component -- the pipeline just needs to produce the option dict, and the chat renderer conditionally mounts `FigureEcharts` when a message payload contains one.
 
-## How PandasAI's Code Generation Pipeline Works
+An ECharts option dict is native Python -- no imports, no sandbox concerns, no extra packages. This is the critical advantage over Plotly, which requires whitelisting and installing a separate library.
 
-Understanding the pipeline is essential to knowing where to intercept it.
+## Pipeline Flow
 
 ```
-1. User calls agent.chat("Plot revenue by region")
+1. agent.chat("Plot revenue by region")
        │
-       ▼
-2. PandasAI builds a prompt containing:
-   - The user query
-   - DataFrame schema (column names, types, sample rows)
-   - Agent description (if provided)
-   - Conversation history
-   - Available skills
+2. PandasAI builds prompt (query + DataFrame schema + Agent description)
+   │  Example bank retrieves top-k similar query-code pairs via semantic search
+   │  and injects them as few-shot context alongside the agent description
        │
-       ▼
-3. LLM generates Python code, e.g.:
-   │  import matplotlib.pyplot as plt
-   │  plt.bar(df["region"], df["revenue"])
-   │  plt.savefig("exports/charts/chart.png")
-   │  result = {"type": "plot", "value": "exports/charts/chart.png"}
+3. LLM generates Python code that builds an ECharts option dict
+   │  (no matplotlib, no imports -- just a dict literal)
+   │  result = {"type": "plot", "value": {echarts option...}}
        │
-       ▼
-4. PandasAI executes the code in a sandbox
-   - Only whitelisted modules allowed (matplotlib, pandas, numpy, etc.)
-   - The code must set a `result` variable
+4. PandasAI executes code in sandbox, extracts `result`
        │
-       ▼
-5. ResponseParser processes the result
-   - format_plot(result)   → for type "plot"
-   - format_dataframe(result) → for type "dataframe"
-   - format_response(result)  → for type "text" / "number"
+5. SolaraResponseParser.format_plot() detects ECharts dict, tags as "echarts"
        │
-       ▼
-6. Parsed result returned to caller
+6. AIService returns {"type": "echarts", "value": dict, "query": str}
+       │
+7. Chat renderer: ChatMessage → ChatMessageContent → FigureEcharts(option=dict)
+       │
+8. Interactive chart in browser (hover, zoom, click)
 ```
 
-**Key integration points** where we can redirect to ECharts:
-- **Step 2**: The Agent `description` field injects instructions into the prompt
-- **Step 3**: The LLM can generate ECharts option dicts instead of matplotlib code
-- **Step 4**: `custom_whitelisted_dependencies` controls which modules are allowed
-- **Step 5**: Custom `ResponseParser` intercepts and tags the response type
+## Step 1: Agent Description
 
-## Approach: Making PandasAI Generate ECharts Option Dicts
-
-The LLM doesn't need to import any library to generate an ECharts chart. An ECharts chart is just a **Python dictionary** -- the LLM generates a dict literal that conforms to the ECharts option spec. No special imports, no sandbox concerns, no extra dependencies.
-
-This is the critical advantage: while Plotly requires whitelisting `plotly` in PandasAI's sandbox and importing the library, **ECharts option dicts are plain Python dicts** that PandasAI can generate and return without any extra dependencies.
-
-### Step 1: Agent Description
-
-PandasAI's `Agent` class accepts a `description` parameter that gets injected into every prompt sent to the LLM. This is the primary mechanism to instruct the LLM on chart format.
+The `description` parameter on PandasAI's `Agent` class is injected into every LLM prompt. This steers code generation away from matplotlib toward ECharts option dicts.
 
 ```python
-ECHARTS_AGENT_DESCRIPTION = """You are a data analysis agent. When asked to create 
-any visualization, chart, or plot, you MUST return an Apache ECharts option 
+ECHARTS_AGENT_DESCRIPTION = """You are a data analysis agent. When asked to create
+any visualization, chart, or plot, you MUST return an Apache ECharts option
 dictionary instead of using matplotlib or any other plotting library.
 
 The result for chart requests must be set as:
     result = {"type": "plot", "value": <echarts_option_dict>}
 
-where <echarts_option_dict> is a Python dictionary following the Apache ECharts 
+where <echarts_option_dict> is a Python dictionary following the Apache ECharts
 option specification (https://echarts.apache.org/en/option.html).
 
 Rules for generating ECharts options:
@@ -85,8 +62,6 @@ Rules for generating ECharts options:
 7. For value axes, use {"type": "value"}
 8. Format numbers and labels clearly
 9. Include "dataZoom" for time series to allow user scrolling
-10. For the result variable, the dict value should be the ECharts option ONLY -- 
-    do not nest it further
 
 Example for a bar chart:
     result = {"type": "plot", "value": {
@@ -99,25 +74,42 @@ Example for a bar chart:
 """
 ```
 
-### Step 2: Custom ResponseParser
+## Step 2: ResponseParser
 
-Create a custom `ResponseParser` that detects ECharts option dicts and tags them with a `"echarts"` type so the Solara frontend knows to render them with `FigureEcharts`.
+Detects ECharts option dicts via key sniffing, sanitizes non-JSON-serializable types (numpy, pandas), and tags the response so the frontend knows to render `FigureEcharts`.
 
 ```python
 # services/response_parser.py
 from pandasai.responses.response_parser import ResponseParser
+import numpy as np
+import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
 
+ECHARTS_KEYS = {"series", "xAxis", "yAxis", "tooltip", "title", "legend",
+                "radar", "geo", "parallel", "calendar", "dataset"}
+
 
 def _is_echarts_option(value) -> bool:
-    """Detect whether a value is an ECharts option dict."""
-    if not isinstance(value, dict):
-        return False
-    echarts_keys = {"series", "xAxis", "yAxis", "tooltip", "title", "legend",
-                    "radar", "geo", "parallel", "calendar", "dataset"}
-    return bool(echarts_keys & set(value.keys()))
+    return isinstance(value, dict) and bool(ECHARTS_KEYS & set(value.keys()))
+
+
+def _sanitize(obj):
+    """Convert numpy/pandas types to JSON-serializable Python types."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(i) for i in obj]
+    return obj
 
 
 class SolaraResponseParser(ResponseParser):
@@ -128,17 +120,15 @@ class SolaraResponseParser(ResponseParser):
         value = result.get("value") if isinstance(result, dict) else result
 
         if _is_echarts_option(value):
-            return {"type": "echarts", "value": value}
+            return {"type": "echarts", "value": _sanitize(value)}
 
-        # Fallback: matplotlib saved a file path
         if isinstance(value, str) and value.endswith((".png", ".jpg", ".svg")):
-            logger.warning("LLM generated matplotlib instead of ECharts; falling back to image")
+            logger.warning("LLM generated matplotlib; falling back to image")
             return {"type": "image", "value": value}
 
         return {"type": "plot", "value": value}
 
     def format_dataframe(self, result):
-        import pandas as pd
         value = result.get("value", result) if isinstance(result, dict) else result
         if isinstance(value, pd.DataFrame):
             return {"type": "dataframe", "value": value}
@@ -149,9 +139,9 @@ class SolaraResponseParser(ResponseParser):
         return {"type": "text", "value": str(value)}
 ```
 
-### Step 3: AIService Wrapper
+## Step 3: AIService
 
-Encapsulate the Agent configuration with ECharts prompt and response parser.
+Wraps the Agent with the ECharts description and custom parser. Normalizes all responses into a consistent shape.
 
 ```python
 # services/ai_service.py
@@ -161,8 +151,6 @@ import pandas as pd
 import logging
 
 logger = logging.getLogger(__name__)
-
-ECHARTS_AGENT_DESCRIPTION = """..."""  # Full description from Step 1 above
 
 
 class AIService:
@@ -174,77 +162,57 @@ class AIService:
                 "response_parser": SolaraResponseParser,
                 "save_charts": False,
                 "open_charts": False,
-                "verbose": False,
             },
             description=ECHARTS_AGENT_DESCRIPTION,
         )
 
     def query(self, message: str) -> dict:
-        """
-        Returns a normalized response:
-        {
-            "type": "echarts" | "dataframe" | "text" | "image" | "error",
-            "value": dict | pd.DataFrame | str,
-            "query": str,
-        }
-        """
+        """Returns {"type": "echarts"|"dataframe"|"text"|"image"|"error",
+                    "value": dict|DataFrame|str, "query": str}"""
         try:
             raw = self.agent.chat(message)
 
-            # ResponseParser already tagged the result
             if isinstance(raw, dict) and "type" in raw:
                 raw["query"] = message
                 return raw
-
-            # Direct ECharts dict returned
             if _is_echarts_option(raw):
                 return {"type": "echarts", "value": raw, "query": message}
-
-            # DataFrame
             if isinstance(raw, pd.DataFrame):
                 return {"type": "dataframe", "value": raw, "query": message}
-
-            # Fallback to text
             return {"type": "text", "value": str(raw), "query": message}
 
         except Exception as e:
             logger.exception("PandasAI query failed")
             return {"type": "error", "value": str(e), "query": message}
-
-    def update_data(self, df: pd.DataFrame):
-        llm = self.agent._config.get("llm") if hasattr(self.agent, '_config') else None
-        self.__init__(df, llm)
 ```
 
-## Rendering ECharts Inside Solara Chat Messages
+## Step 4: Chat Rendering
 
-Solara's `ChatMessage` component accepts **any Solara component** as children. This means `FigureEcharts` can be placed directly inside a message bubble.
+Solara's `ChatMessage` accepts **any Solara component** as children via the `with` context manager. The message data model stores the ECharts option dict in the payload, and a dispatcher component conditionally renders `FigureEcharts` vs `Markdown` vs `DataFrame` based on type.
 
-### Message Data Model
-
-Each message in the chat is stored as a dict:
+### Message data model
 
 ```python
 {
     "role": "user" | "assistant",
     "type": "text" | "echarts" | "dataframe" | "image" | "error",
-    "content": str | dict | pd.DataFrame,  # ECharts option dict for type "echarts"
-    "query": str,  # Original user query (for assistant messages)
+    "content": str | dict | pd.DataFrame,
+    "query": str,  # original user question (assistant messages only)
 }
 ```
 
-### ChatMessageContent Component
-
-Renders the appropriate component based on message type. For ECharts messages, it renders `FigureEcharts` with the option dict.
+### Components
 
 ```python
 # components/chat.py
 import solara
 import pandas as pd
+import json
 
 
 @solara.component
 def ChatMessageContent(message: dict):
+    """Dispatches to the right renderer based on message type."""
     msg_type = message.get("type", "text")
     content = message.get("content")
 
@@ -262,425 +230,280 @@ def ChatMessageContent(message: dict):
 
 @solara.component
 def EChartsChartMessage(option: dict):
-    """Renders an interactive ECharts chart inside a chat message with
-    theme-aware styling and a fixed height container."""
+    """Renders an interactive ECharts chart inside a chat message.
+    Handles theming, validation, sizing, and click events."""
     dark = solara.lab.use_dark_effective()
+    themed = solara.use_memo(lambda: _apply_theme(option, dark), [option, dark])
 
-    themed_option = solara.use_memo(lambda: _apply_theme(option, dark), [option, dark])
+    # Malformed specs render a blank chart silently -- validate first
+    if not option.get("series"):
+        solara.Warning("Chart data missing. Try rephrasing your question.")
+        return
 
     solara.FigureEcharts(
-        option=themed_option,
+        option=themed,
+        on_click=_on_chart_click,
         responsive=True,
         attributes={"style": "width: 100%; height: 400px; min-width: 300px;"},
     )
 
 
+def _on_chart_click(event_data):
+    """Receives {name, value, dataIndex, seriesName, ...} on click."""
+    pass  # Wire to drill-down or follow-up query as needed
+
+
 def _apply_theme(option: dict, dark: bool) -> dict:
-    """Non-destructively apply dark/light theme colors to an ECharts option."""
-    themed = {**option}
-
+    """Non-destructively overlay dark/light colors onto an ECharts option."""
+    themed = {**option, "backgroundColor": "transparent"}
     text_color = "#ccc" if dark else "#333"
-    bg_color = "transparent"
-
-    themed["backgroundColor"] = bg_color
+    line_color = "#555" if dark else "#ccc"
 
     if "title" in themed:
-        themed["title"] = {**themed.get("title", {}), "textStyle": {"color": text_color}}
-
+        themed["title"] = {**themed["title"], "textStyle": {"color": text_color}}
     if "legend" in themed:
-        themed["legend"] = {**themed.get("legend", {}), "textStyle": {"color": text_color}}
+        themed["legend"] = {**themed["legend"], "textStyle": {"color": text_color}}
 
-    for axis_key in ("xAxis", "yAxis"):
-        if axis_key in themed:
-            axis = themed[axis_key]
-            if isinstance(axis, dict):
-                themed[axis_key] = {
-                    **axis,
-                    "axisLabel": {**axis.get("axisLabel", {}), "color": text_color},
-                    "axisLine": {"lineStyle": {"color": "#555" if dark else "#ccc"}},
-                }
-            elif isinstance(axis, list):
-                themed[axis_key] = [
-                    {**a, "axisLabel": {**a.get("axisLabel", {}), "color": text_color}}
-                    for a in axis
-                ]
+    for key in ("xAxis", "yAxis"):
+        if key not in themed:
+            continue
+        axis = themed[key]
+        if isinstance(axis, dict):
+            themed[key] = {**axis,
+                "axisLabel": {**axis.get("axisLabel", {}), "color": text_color},
+                "axisLine": {"lineStyle": {"color": line_color}}}
+        elif isinstance(axis, list):
+            themed[key] = [{**a,
+                "axisLabel": {**a.get("axisLabel", {}), "color": text_color}}
+                for a in axis]
 
     return themed
 ```
 
-### Chat Page Component
-
-The full chat page wiring messages, input, and the AIService together.
+### Wiring into the chat page
 
 ```python
-# pages/explorer.py
-import solara
-from services.ai_service import AIService
-from components.chat import ChatMessageContent
-import ipyvuetify as v
-
-ai_service = solara.reactive(None)
-messages = solara.reactive([])
-processing = solara.reactive(False)
-
-
-@solara.component
-def Page():
-    # Initialize service (simplified -- real version loads data from config)
-    def init():
-        import pandas as pd
-        df = pd.read_csv("data/sample.csv")
-        from config import get_llm
-        ai_service.value = AIService(df, get_llm())
-    solara.use_effect(init, [])
-
-    with solara.Column(style={"height": "calc(100vh - 130px)"}):
-        ChatArea()
-        QuerySuggestions()
-        ChatInputBar()
-
-
-@solara.component
-def ChatArea():
-    with solara.lab.ChatBox():
-        for msg in messages.value:
-            is_user = msg["role"] == "user"
-
-            with solara.lab.ChatMessage(
-                user=is_user,
-                name="You" if is_user else "Assistant",
-                avatar="mdi-account" if is_user else "mdi-robot",
-                notch=True,
-            ):
-                ChatMessageContent(message=msg)
-
-        # Typing indicator while processing
-        if processing.value:
-            with solara.lab.ChatMessage(
-                user=False,
-                name="Assistant",
-                avatar="mdi-robot",
-            ):
-                solara.display(v.ProgressCircular(
-                    indeterminate=True, size=24, width=2, color="primary"
-                ))
-                solara.Text("Analyzing your data...")
-
-
-@solara.component
-def ChatInputBar():
-    def send(user_message: str):
-        if not user_message.strip() or not ai_service.value:
-            return
-
-        # Add user message
-        messages.value = [
-            *messages.value,
-            {"role": "user", "type": "text", "content": user_message},
-        ]
-
-        processing.value = True
-
-        # Run PandasAI query
-        result = ai_service.value.query(user_message)
-
-        # Add assistant response
-        messages.value = [
-            *messages.value,
-            {
-                "role": "assistant",
-                "type": result["type"],
-                "content": result["value"],
-                "query": user_message,
-            },
-        ]
-
-        processing.value = False
-
-    solara.lab.ChatInput(
-        send_callback=send,
-        disabled=processing.value,
-    )
-
-
-@solara.component
-def QuerySuggestions():
-    """Clickable example queries shown above the input."""
-    suggestions = [
-        "Show top 10 by revenue",
-        "Plot monthly revenue trend",
-        "Show distribution by category",
-        "Compare regions as a bar chart",
-    ]
-
-    if not messages.value:
-        with solara.Row(gap="8px", style={"flex-wrap": "wrap", "padding": "8px"}):
-            for suggestion in suggestions:
-                def on_click(s=suggestion):
-                    # Trigger the same flow as typing
-                    ChatInputBar  # re-render handled by reactive
-                solara.Button(
-                    suggestion,
-                    outlined=True,
-                    small=True,
-                    on_click=lambda s=suggestion: send_suggestion(s),
-                )
-
-
-def send_suggestion(text: str):
-    """Send a suggestion query through the same pipeline."""
-    if not ai_service.value:
-        return
-    messages.value = [
-        *messages.value,
-        {"role": "user", "type": "text", "content": text},
-    ]
-    processing.value = True
-    result = ai_service.value.query(text)
-    messages.value = [
-        *messages.value,
-        {"role": "assistant", "type": result["type"], "content": result["value"], "query": text},
-    ]
-    processing.value = False
+# In pages/explorer.py
+with solara.lab.ChatBox():
+    for msg in messages.value:
+        with solara.lab.ChatMessage(
+            user=(msg["role"] == "user"),
+            name="You" if msg["role"] == "user" else "Assistant",
+        ):
+            ChatMessageContent(message=msg)
 ```
 
-## Handling Click Events on Chat Charts
+## ECharts Example Bank Entries
 
-ECharts charts in the chat can be interactive beyond just hover. The `on_click` callback receives the clicked data point, enabling drill-down or follow-up queries.
+The example bank (vector store with semantic search) already exists. At query time, the top-k most similar entries are retrieved and injected into the LLM prompt as few-shot context. This section catalogs the **code examples** for each chart type that should be stored in the bank.
 
-```python
-@solara.component
-def EChartsChartMessage(option: dict):
-    dark = solara.lab.use_dark_effective()
-    themed_option = solara.use_memo(lambda: _apply_theme(option, dark), [option, dark])
+Each entry is a `(query, code)` pair. The code runs in PandasAI's sandbox where `dfs` (the list of dataframes) is provided. No imports are needed -- the output is always a plain dict assigned to `result`.
 
-    def on_chart_click(event_data):
-        """When user clicks a bar/point, send a follow-up query about that item."""
-        name = event_data.get("name", "")
-        if name and ai_service.value:
-            follow_up = f"Tell me more about {name}"
-            send_suggestion(follow_up)
+`FigureEcharts` renders any valid ECharts option dict regardless of chart type -- the rendering pipeline is chart-type-agnostic. The diversity is entirely in the option dict structure.
 
-    solara.FigureEcharts(
-        option=themed_option,
-        on_click=on_chart_click,
-        responsive=True,
-        attributes={"style": "width: 100%; height: 400px; min-width: 300px;"},
-    )
-```
-
-## What the LLM-Generated Code Looks Like
-
-When the Agent processes a chart request, the LLM generates plain Python code that builds a dict. No imports needed:
+### Bar Chart
 
 ```python
-# Example code generated by the LLM for "Plot revenue by region as a bar chart"
-# PandasAI provides `dfs` as the list of dataframes
-
+# query: "Plot revenue by region as a bar chart"
 df = dfs[0]
-regions = df["region"].tolist()
-revenue = df["revenue"].tolist()
-
 result = {
     "type": "plot",
     "value": {
         "title": {"text": "Revenue by Region"},
         "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
-        "xAxis": {"type": "category", "data": regions},
+        "xAxis": {"type": "category", "data": df["region"].tolist()},
         "yAxis": {"type": "value", "name": "Revenue ($)"},
-        "series": [{
-            "type": "bar",
-            "data": revenue,
-            "itemStyle": {"borderRadius": [4, 4, 0, 0]},
-        }],
+        "series": [{"type": "bar", "data": df["revenue"].tolist(),
+                    "itemStyle": {"borderRadius": [4, 4, 0, 0]}}],
     }
 }
 ```
 
+### Pie / Donut Chart
+
 ```python
-# Example for "Show distribution of sales by category as a pie chart"
-
+# query: "Show distribution of sales by category as a pie chart"
 df = dfs[0]
-categories = df.groupby("category")["sales"].sum().reset_index()
-pie_data = [{"name": row["category"], "value": int(row["sales"])} 
-            for _, row in categories.iterrows()]
-
+grouped = df.groupby("category")["sales"].sum().reset_index()
 result = {
     "type": "plot",
     "value": {
-        "title": {"text": "Sales Distribution by Category"},
+        "title": {"text": "Sales by Category"},
         "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
-        "series": [{
-            "type": "pie",
-            "radius": ["40%", "70%"],
-            "data": pie_data,
-            "emphasis": {"itemStyle": {"shadowBlur": 10, "shadowColor": "rgba(0,0,0,0.5)"}},
-        }],
+        "series": [{"type": "pie", "radius": ["40%", "70%"],
+                    "data": [{"name": r["category"], "value": int(r["sales"])}
+                             for _, r in grouped.iterrows()]}],
     }
 }
 ```
 
+### Stacked Bar Chart
+
+The `"stack"` key groups series into a single stacked column. All series sharing the same `stack` value are stacked together.
+
 ```python
-# Example for "Show monthly revenue trend over time"
-
+# query: "Show quarterly revenue by product line as a stacked bar chart"
 df = dfs[0]
-df["month"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m")
-monthly = df.groupby("month")["revenue"].sum().reset_index()
-
+quarters = df["quarter"].unique().tolist()
 result = {
     "type": "plot",
     "value": {
-        "title": {"text": "Monthly Revenue Trend"},
-        "tooltip": {"trigger": "axis"},
-        "xAxis": {"type": "category", "data": monthly["month"].tolist()},
-        "yAxis": {"type": "value", "name": "Revenue"},
-        "dataZoom": [{"type": "slider", "start": 0, "end": 100}],
-        "series": [{
-            "type": "line",
-            "data": monthly["revenue"].tolist(),
-            "smooth": True,
-            "areaStyle": {"opacity": 0.3},
-        }],
+        "title": {"text": "Revenue by Product Line (Stacked)"},
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "shadow"}},
+        "legend": {},
+        "xAxis": {"type": "category", "data": quarters},
+        "yAxis": {"type": "value", "name": "Revenue ($)"},
+        "series": [
+            {"name": name,
+             "type": "bar",
+             "stack": "total",
+             "data": grp.set_index("quarter").reindex(quarters)["revenue"].fillna(0).tolist()}
+            for name, grp in df.groupby("product_line")
+        ],
     }
 }
 ```
+
+### Bar + Line Combo with Dual Y-Axis
+
+Use `yAxis` as a **list** of two axis configs. Each series references its axis via `yAxisIndex`.
+
+```python
+# query: "Show monthly revenue as bars and profit margin as a line on a secondary axis"
+df = dfs[0]
+months = df["month"].tolist()
+result = {
+    "type": "plot",
+    "value": {
+        "title": {"text": "Revenue & Profit Margin"},
+        "tooltip": {"trigger": "axis"},
+        "legend": {},
+        "xAxis": {"type": "category", "data": months},
+        "yAxis": [
+            {"type": "value", "name": "Revenue ($)", "position": "left"},
+            {"type": "value", "name": "Margin (%)", "position": "right",
+             "axisLabel": {"formatter": "{value}%"}, "max": 100},
+        ],
+        "series": [
+            {"name": "Revenue", "type": "bar", "yAxisIndex": 0,
+             "data": df["revenue"].tolist()},
+            {"name": "Margin", "type": "line", "yAxisIndex": 1,
+             "smooth": True, "data": df["margin_pct"].tolist()},
+        ],
+    }
+}
+```
+
+Note: `_apply_theme()` already handles `yAxis` as both a dict and a list (see Chat Rendering section), so dual-axis charts theme correctly without changes.
+
+### Box Plot
+
+ECharts boxplot expects pre-computed five-number summaries: `[min, Q1, median, Q3, max]` per category.
+
+```python
+# query: "Show salary distribution by department as a box plot"
+df = dfs[0]
+categories = []
+box_data = []
+for dept, grp in df.groupby("department"):
+    s = grp["salary"]
+    categories.append(dept)
+    box_data.append([
+        float(s.min()), float(s.quantile(0.25)), float(s.median()),
+        float(s.quantile(0.75)), float(s.max())
+    ])
+result = {
+    "type": "plot",
+    "value": {
+        "title": {"text": "Salary Distribution by Department"},
+        "tooltip": {"trigger": "item"},
+        "xAxis": {"type": "category", "data": categories},
+        "yAxis": {"type": "value", "name": "Salary ($)"},
+        "series": [{"type": "boxplot", "data": box_data}],
+    }
+}
+```
+
+### Heatmap
+
+Heatmap data is a list of `[xIndex, yIndex, value]` triples. Requires `visualMap` to map values to colors.
+
+```python
+# query: "Show a heatmap of sales by day of week and hour"
+df = dfs[0]
+days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+hours = [str(h) for h in range(24)]
+pivot = df.pivot_table(index="day_of_week", columns="hour", values="sales",
+                       aggfunc="sum", fill_value=0)
+data = []
+for i, day in enumerate(days):
+    for j in range(24):
+        data.append([j, i, int(pivot.loc[day, j]) if day in pivot.index else 0])
+max_val = max(d[2] for d in data) if data else 1
+result = {
+    "type": "plot",
+    "value": {
+        "title": {"text": "Sales Heatmap: Day x Hour"},
+        "tooltip": {"position": "top",
+                    "formatter": "{c} sales"},
+        "xAxis": {"type": "category", "data": hours, "splitArea": {"show": True}},
+        "yAxis": {"type": "category", "data": days, "splitArea": {"show": True}},
+        "visualMap": {"min": 0, "max": max_val, "calculable": True,
+                      "orient": "horizontal", "left": "center", "bottom": 0},
+        "series": [{"type": "heatmap", "data": data,
+                    "label": {"show": False},
+                    "emphasis": {"itemStyle": {"shadowBlur": 10}}}],
+    }
+}
+```
+
+### Authoring Guidelines for New Examples
+
+When adding entries to the example bank:
+
+1. **One example per chart pattern.** Each entry should demonstrate a single ECharts chart type or variation (e.g., stacked bar is separate from grouped bar).
+2. **Keep data manipulation minimal.** The example bank teaches the LLM the ECharts option dict structure, not pandas. Use simple `groupby`, `pivot_table`, or column access.
+3. **Always cast to native types.** Use `.tolist()`, `int()`, `float()` on any pandas/numpy values to avoid serialization failures downstream.
+4. **Include tooltip and title.** Every example should set `tooltip` (with appropriate `trigger`) and `title` so the LLM learns to include them consistently.
+5. **Match query phrasing to real user language.** The semantic search retrieves by similarity to the user's query, so phrase example queries naturally (e.g., "Show me a breakdown of..." not "Generate an ECharts option dict for...").
 
 ## Why This Works Without Extra Dependencies
 
-This is the key architectural advantage of the ECharts approach:
+| Concern | Plotly | ECharts |
+|---------|--------|---------|
+| **LLM output** | Python code importing `plotly.express` | Plain dict literal -- no imports |
+| **Sandbox** | Must whitelist `plotly` | Nothing -- dicts are native Python |
+| **Install** | `pip install pandasai[plotly]` + `plotly` | Nothing -- `FigureEcharts` is built into Solara |
+| **Serialization** | `go.Figure` must serialize over WebSocket | Dicts serialize trivially as JSON |
 
-| Concern | Plotly approach | ECharts approach |
-|---------|----------------|------------------|
-| **LLM output** | Python code importing `plotly.express` | Python dict literal (no imports) |
-| **Sandbox whitelist** | Must add `"plotly"` to `custom_whitelisted_dependencies` | No extra whitelist needed -- dicts are native Python |
-| **Package install** | `pip install pandasai[plotly]` + `plotly` | Nothing -- ECharts is built into Solara |
-| **Serialization** | `go.Figure` objects must serialize over WebSocket | Plain dicts serialize trivially as JSON |
-| **Solara component** | `FigurePlotly` (requires `plotly` package) | `FigureEcharts` (built into Solara, zero dependencies) |
+## Practical Gotchas
 
-The LLM produces a **plain Python dict**. PandasAI executes it with no special imports. The dict travels through the ResponseParser, through the WebSocket, and arrives at `FigureEcharts` as-is.
+**Blank chart, no error.** A malformed ECharts option (e.g., missing `series` or wrong data shape) renders a blank chart container -- it does not throw an exception. Always validate `option.get("series")` before rendering.
 
-## Error Handling
+**Height collapse.** `FigureEcharts` inside a chat bubble will collapse to zero height without explicit dimensions. The `attributes` parameter (not `style`) controls this: `attributes={"style": "height: 400px;"}`. The Solara docs confirm this is the correct API -- the default is `attributes={"style": "height: 400px;"}`.
 
-### Invalid ECharts Options
+**State timing.** The ECharts option dict must be stored in the reactive message list *before* the `ChatMessage` renders. Append the complete message (with the option dict in `content`) to the reactive list in one assignment, not incrementally.
 
-The LLM may generate a malformed option dict. Wrap rendering in error handling:
+**Non-serializable types.** The LLM-generated code operates on pandas DataFrames, so the option dict may contain `numpy.int64`, `numpy.float64`, `numpy.ndarray`, or `pd.Timestamp` values. These must be converted to native Python types before reaching `FigureEcharts`. The `_sanitize()` function in the ResponseParser handles this.
 
-```python
-@solara.component
-def EChartsChartMessage(option: dict):
-    dark = solara.lab.use_dark_effective()
-    themed_option = solara.use_memo(lambda: _apply_theme(option, dark), [option, dark])
+**Matplotlib fallback.** Despite prompt instructions, the LLM occasionally reverts to matplotlib. The ResponseParser detects file path strings (`.png`, `.jpg`) and tags them as `"image"` type. The chat renderer shows `solara.Image(path)` -- degraded but functional.
 
-    if not option.get("series"):
-        solara.Warning("Chart generated but missing series data. Try rephrasing your question.")
-        return
+**Why not `solara.HTML` with raw ECharts JS.** You could inject ECharts via an iframe or `solara.HTML`, but this loses the ipywidget bidirectional event model -- no `on_click`, `on_mouseover`, or `on_mouseout` callbacks. `FigureEcharts` is a proper Solara/ipywidget component that preserves these.
 
-    try:
-        solara.FigureEcharts(
-            option=themed_option,
-            responsive=True,
-            attributes={"style": "width: 100%; height: 400px; min-width: 300px;"},
-        )
-    except Exception as e:
-        solara.Error(f"Failed to render chart: {e}")
-        with solara.Details("Raw chart data"):
-            solara.Markdown(f"```json\n{json.dumps(option, indent=2, default=str)}\n```")
-```
+## PPTX Export Bridge
 
-### LLM Falls Back to Matplotlib
-
-Despite the prompt, the LLM may occasionally revert to matplotlib. The `SolaraResponseParser.format_plot()` detects file paths and tags them as `"image"` type. The `ChatMessageContent` component renders these as `solara.Image(path)` -- degraded but not broken.
-
-### Non-Serializable Values
-
-ECharts options must be JSON-serializable. If the LLM puts numpy arrays or pandas objects in the dict, convert them:
-
-```python
-import json
-import numpy as np
-import pandas as pd
-
-def sanitize_echarts_option(option: dict) -> dict:
-    """Ensure all values in an ECharts option dict are JSON-serializable."""
-    def convert(obj):
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, pd.Timestamp):
-            return obj.isoformat()
-        if isinstance(obj, dict):
-            return {k: convert(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [convert(i) for i in obj]
-        return obj
-    return convert(option)
-```
-
-Call this in the ResponseParser:
-
-```python
-def format_plot(self, result):
-    value = result.get("value") if isinstance(result, dict) else result
-    if _is_echarts_option(value):
-        return {"type": "echarts", "value": sanitize_echarts_option(value)}
-    # ... fallbacks
-```
-
-## Sizing Charts in Chat Messages
-
-Chat messages have constrained width. The ECharts container needs explicit sizing:
-
-```python
-solara.FigureEcharts(
-    option=themed_option,
-    responsive=True,
-    attributes={
-        "style": "width: 100%; height: 400px; min-width: 300px;",
-        "class": "echarts-chat-chart",
-    },
-)
-```
-
-Add CSS to handle the chat context:
-
-```css
-/* assets/custom.css */
-.echarts-chat-chart {
-    border-radius: 8px;
-    margin: 8px 0;
-}
-
-/* Prevent chat message from constraining chart width */
-.solara-chat-message .echarts-chat-chart {
-    min-width: 300px;
-    max-width: 100%;
-}
-```
-
-## Static Image Export for PowerPoint
-
-ECharts charts rendered in the browser cannot use Plotly's simple `to_image()` for PPTX export (see PRD 07). Two options:
-
-**Option A: Convert ECharts data to Plotly at export time**
-
-Since we have the raw data in the ECharts option dict, convert it to a Plotly figure only when PPTX export is requested:
+ECharts charts live in the browser and have no Python-side `to_image()`. For PowerPoint export (PRD 07), convert the stored ECharts data to a Plotly figure at export time:
 
 ```python
 import plotly.graph_objects as go
 
 def echarts_to_plotly(option: dict) -> go.Figure:
-    """Convert an ECharts option dict to a Plotly figure for static export."""
     fig = go.Figure()
-
     for series in option.get("series", []):
         chart_type = series.get("type", "bar")
         data = series.get("data", [])
         name = series.get("name", "")
-
-        x_data = option.get("xAxis", {}).get("data", list(range(len(data))))
+        x_data = option.get("xAxis", {})
         if isinstance(x_data, dict):
             x_data = x_data.get("data", list(range(len(data))))
 
@@ -688,35 +511,17 @@ def echarts_to_plotly(option: dict) -> go.Figure:
             fig.add_trace(go.Bar(x=x_data, y=data, name=name))
         elif chart_type == "line":
             fig.add_trace(go.Scatter(x=x_data, y=data, mode="lines", name=name))
-        elif chart_type == "scatter":
-            fig.add_trace(go.Scatter(x=x_data, y=data, mode="markers", name=name))
         elif chart_type == "pie":
             labels = [d["name"] for d in data if isinstance(d, dict)]
             values = [d["value"] for d in data if isinstance(d, dict)]
-            fig.add_trace(go.Pie(labels=labels, values=values, name=name))
+            fig.add_trace(go.Pie(labels=labels, values=values))
 
     title = option.get("title", {}).get("text", "")
     fig.update_layout(title=title, template="plotly_white")
     return fig
 ```
 
-Then in the PPTX export pipeline:
-
-```python
-def export_message_to_slide(builder, msg):
-    if msg["type"] == "echarts":
-        fig = echarts_to_plotly(msg["content"])
-        builder.add_chart_slide(fig=fig, title=msg.get("query", "Chart"))
-```
-
-**Option B: Use pyppeteer for server-side ECharts rendering** (heavier, but pixel-perfect)
-
-```python
-# Requires: pip install pyppeteer snapshot-pyppeteer
-# Renders ECharts option as PNG via headless Chrome
-```
-
-Option A is recommended for simplicity. Option B preserves exact ECharts styling but adds deployment complexity.
+Then: `fig.to_image(format="png", scale=2)` via Kaleido for the PPTX slide.
 
 ## Dependencies
 
@@ -726,8 +531,8 @@ dependencies = [
     "solara>=1.35",
     "pandasai>=2.3,<3.0",
     "pandas>=2.0",
-    # ECharts: ZERO extra dependencies (built into Solara)
-    # Plotly only needed if using PPTX export (PRD 07):
+    # ECharts: zero extra deps (built into Solara)
+    # Only needed for PPTX export (PRD 07):
     "plotly>=5.18",
     "kaleido>=1.0",
 ]
@@ -735,34 +540,25 @@ dependencies = [
 
 ## Implementation Plan
 
-### Phase 1: Core Pipeline
-1. Write `ECHARTS_AGENT_DESCRIPTION` prompt with ECharts generation instructions and examples
-2. Implement `SolaraResponseParser` with `_is_echarts_option()` detection and `sanitize_echarts_option()`
-3. Implement `AIService` wrapping the Agent with description and parser
-4. Implement `EChartsChartMessage` component with theme handling
-
-### Phase 2: Chat Integration
-5. Implement `ChatMessageContent` dispatcher (echarts/dataframe/text/image/error)
-6. Build the `ChatArea` page with `ChatBox`, `ChatMessage`, and `ChatInput`
-7. Add processing indicator (spinning `v.ProgressCircular` in a ChatMessage)
-8. Add query suggestion chips
-
-### Phase 3: Interactivity
-9. Add `on_click` handlers for drill-down follow-up queries
-10. Add chart sizing CSS for chat message context
-11. Test across chart types: bar, line, pie, scatter, heatmap
-
-### Phase 4: Export
-12. Implement `echarts_to_plotly()` converter for PPTX export
-13. Wire export button into chat toolbar
+1. Write `ECHARTS_AGENT_DESCRIPTION` prompt with examples
+2. Implement `SolaraResponseParser` with detection + sanitization
+3. Implement `AIService` wrapping Agent with description and parser
+4. Implement `EChartsChartMessage` component (theming, validation, sizing, click)
+5. Implement `ChatMessageContent` dispatcher
+6. Wire into chat page with `ChatBox`/`ChatMessage`/`ChatInput`
+7. Add processing indicator during PandasAI execution
+8. Author example bank entries for each chart type (bar, pie, stacked bar, dual-axis, boxplot, heatmap) and seed into vector store
+9. Test LLM output quality across chart types with and without few-shot examples; iterate on example phrasing
+10. Implement `echarts_to_plotly()` bridge for PPTX export
 
 ## Acceptance Criteria
 
-1. Asking "Plot revenue by region" in the chat produces an interactive ECharts bar chart inside the assistant's message bubble
-2. Charts support hover (tooltips show values), zoom (via dataZoom on time series), and click events
-3. Charts adapt to the app's dark/light theme
-4. If the LLM falls back to matplotlib, a static image is rendered (not a crash)
-5. ECharts option dicts with numpy/pandas types are sanitized before rendering
-6. Charts resize responsively when the chat container width changes
-7. No extra Python packages are required beyond Solara and PandasAI for chart rendering
-8. PPTX export converts ECharts data to Plotly figures for static image generation
+1. Chart requests produce interactive ECharts inside chat message bubbles
+2. Charts support hover tooltips, zoom (dataZoom), and click events
+3. Charts adapt to dark/light theme
+4. Matplotlib fallback renders a static image (not a crash)
+5. numpy/pandas types are sanitized before rendering
+6. Charts resize responsively within the chat container
+7. No extra Python packages required for chart rendering (only Solara + PandasAI)
+8. Complex chart types (stacked bar, dual-axis, boxplot, heatmap) render correctly when guided by example bank entries
+9. Dual-axis charts theme correctly (both axes pick up dark/light colors)
